@@ -18,3 +18,5 @@ Algorithm and data structure problem from leetcode is solved here
             * ReverseString.py
     * problem_solving/
         * count_odd_numbers_in_an_interval_range.py
+
+Total Problem Solved: 10
