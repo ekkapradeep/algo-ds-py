@@ -1,19 +1,149 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+trigger: none
 
-trigger:
-- main
+parameters:
+  - name: fixVersion
+    displayName: "Fix Version (e.g., 1.2.0)"
+    type: string
 
 pool:
-  vmImage: ubuntu-latest
+  vmImage: 'ubuntu-latest'
 
-steps:
-- script: echo Hello, world! testing
-  displayName: 'Run a one-line script'
+variables:
+  org: "YOUR_ORG"
+  project: "YOUR_PROJECT"
+  repo: "YOUR_REPO"
+  sourceBranch: "develop"
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+stages:
+  - stage: ManageReleaseBranch
+    displayName: "Create or Update Release Branch"
+    jobs:
+      - job: CollectAndMerge
+        displayName: "Collect Approved PRs and Merge to Release Branch"
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - task: PowerShell@2
+            displayName: "Get approved PR commits for Fix Version"
+            name: getPRs
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            inputs:
+              targetType: 'inline'
+              script: |
+                $ErrorActionPreference = "Stop"
+                $fixVersion = "${{ parameters.fixVersion }}"
+                $org = "$(org)"
+                $project = "$(project)"
+                $repo = "$(repo)"
+                $headers = @{
+                  Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN"
+                  "Content-Type" = "application/json"
+                }
+
+                Write-Host "🔍 Fetching work items with FixVersion = $fixVersion..."
+                $workItemsUrl = "https://dev.azure.com/$org/$project/_apis/wit/wiql?api-version=7.0"
+                $body = @{
+                  query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
+                } | ConvertTo-Json
+
+                $workItems = Invoke-RestMethod -Uri $workItemsUrl -Headers $headers -Method Post -Body $body
+                $ids = $workItems.workItems | ForEach-Object { $_.id }
+
+                if (-not $ids) {
+                  Write-Host "⚠️ No work items found for FixVersion $fixVersion"
+                  exit 0
+                }
+
+                Write-Host "📋 Found $($ids.Count) work items"
+                $finalWorkItems = @()
+                $approvedPRs = @()
+
+                foreach ($id in $ids) {
+                  Write-Host "`n🔗 Checking linked PRs for Work Item #$id"
+                  $relationsUrl = "https://dev.azure.com/$org/$project/_apis/wit/workitems/$id?api-version=7.0"
+                  $wi = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
+                  $prLinks = $wi.relations | Where-Object { $_.rel -like "*PullRequest*" }
+
+                  if (-not $prLinks) {
+                    Write-Host "⚠️ No PRs linked to work item $id — skipping"
+                    continue
+                  }
+
+                  $allApproved = $true
+                  $localPRs = @()
+
+                  foreach ($pr in $prLinks) {
+                    if ($pr.url -match "pullrequests/([0-9]+)") {
+                      $prId = $matches[1]
+                      $prDetailsUrl = "https://dev.azure.com/$org/$project/_apis/git/repositories/$repo/pullrequests/$prId?api-version=7.0"
+                      $prDetails = Invoke-RestMethod -Uri $prDetailsUrl -Headers $headers
+
+                      if ($prDetails.status -ne "completed" -or $prDetails.mergeStatus -ne "succeeded" -or $prDetails.isDraft -eq $true) {
+                        Write-Host "🚫 PR #$($prDetails.pullRequestId) for Work Item #$id is not approved — skipping this work item."
+                        $allApproved = $false
+                        break
+                      }
+
+                      $localPRs += $prDetails
+                    }
+                  }
+
+                  if ($allApproved -and $localPRs.Count -gt 0) {
+                    Write-Host "✅ All PRs approved for Work Item #$id"
+                    $finalWorkItems += $id
+                    $approvedPRs += $localPRs
+                  }
+                }
+
+                if (-not $finalWorkItems) {
+                  Write-Host "⚠️ No fully approved work items found for FixVersion $fixVersion"
+                  exit 0
+                }
+
+                Write-Host "`n📦 Final Work Items eligible for release: $($finalWorkItems -join ', ')"
+
+                # Export PR commits for next step
+                $commitList = @()
+                foreach ($pr in $approvedPRs) {
+                  $commitList += $pr.lastMergeCommit.commitId
+                }
+
+                if (-not $commitList) {
+                  Write-Host "⚠️ No commits found from approved PRs."
+                  exit 0
+                }
+
+                $commitListString = $commitList -join ","
+                Write-Host "##vso[task.setvariable variable=commitList]$commitListString"
+                Write-Host "✅ Found commits: $commitListString"
+
+          - script: |
+              set -e
+              FIX_VERSION=${{ parameters.fixVersion }}
+              BRANCH_NAME="release/${FIX_VERSION}"
+              SOURCE_BRANCH="$(sourceBranch)"
+              COMMITS="${commitList}"
+
+              echo "🔧 Preparing release branch: ${BRANCH_NAME}"
+              git fetch origin
+              if git show-ref --quiet refs/remotes/origin/${BRANCH_NAME}; then
+                echo "Branch exists — updating."
+                git checkout ${BRANCH_NAME}
+                git pull origin ${BRANCH_NAME}
+              else
+                echo "Branch not found — creating new."
+                git checkout origin/${SOURCE_BRANCH} -b ${BRANCH_NAME}
+              fi
+
+              echo "📦 Merging commits: ${COMMITS}"
+              IFS=',' read -ra COMMIT_ARRAY <<< "$COMMITS"
+              for commit in "${COMMIT_ARRAY[@]}"; do
+                echo "Merging commit $commit"
+                git cherry-pick $commit || true
+              done
+
+              echo "🚀 Pushing updates to origin/${BRANCH_NAME}"
+              git push origin ${BRANCH_NAME}
+            displayName: "Merge approved PR commits into release branch"
