@@ -15,9 +15,6 @@ stages:
         pool:
           vmImage: 'ubuntu-latest'
         steps:
-          - checkout: self
-            persistCredentials: true  # <-- allows $(System.AccessToken) to be used
-
           - task: PowerShell@2
             displayName: "Create/Update Release Branch"
             inputs:
@@ -43,10 +40,11 @@ stages:
 
                 $wiqlUrl = "$orgUrl/$project/_apis/wit/wiql?api-version=7.0"
                 try {
-                  $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
+                    $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
                 } catch {
-                  Write-Host "❌ Failed to fetch work items: $($_.Exception.Message)"
-                  exit 1
+                    $errMsg = $_.Exception.Message
+                    Write-Host "❌ Failed to fetch work items: $errMsg"
+                    exit 1
                 }
 
                 if (-not $wiqlResult.workItems) {
@@ -93,7 +91,8 @@ stages:
                         }
 
                     } catch {
-                        Write-Host "❌ Failed to fetch Work Item #$wiId: $($_.Exception.Message)"
+                        $errMsg = $_.Exception.Message
+                        Write-Host "❌ Failed to fetch Work Item #$wiId: $errMsg"
                     }
                 }
 
@@ -123,22 +122,27 @@ stages:
                 foreach ($wiId in $finalWorkItems) {
                     Write-Host "🔗 Processing PRs for Work Item #$wiId..."
                     $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
-                    $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
-                    $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
+                    try {
+                        $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
+                        $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
 
-                    foreach ($prLink in $prLinks) {
-                        if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
-                            $prId = $matches[1]
-                            $prApiUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId?api-version=7.0"
-                            $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
+                        foreach ($prLink in $prLinks) {
+                            if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
+                                $prId = $matches[1]
+                                $prApiUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId?api-version=7.0"
+                                $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
 
-                            if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
-                                $sourceBranch = $pr.sourceRefName.Replace("refs/heads/", "")
-                                Write-Host "🔀 Merging commits from branch: $sourceBranch"
-                                git fetch origin $sourceBranch
-                                git merge origin/$sourceBranch --no-edit
+                                if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
+                                    $sourceBranch = $pr.sourceRefName.Replace("refs/heads/", "")
+                                    Write-Host "🔀 Merging commits from branch: $sourceBranch"
+                                    git fetch origin $sourceBranch
+                                    git merge origin/$sourceBranch --no-edit
+                                }
                             }
                         }
+                    } catch {
+                        $errMsg = $_.Exception.Message
+                        Write-Host "❌ Failed to process PRs for Work Item #$wiId: $errMsg"
                     }
                 }
 
