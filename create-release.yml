@@ -65,14 +65,14 @@ steps:
           try {
             $wi = Invoke-RestMethod -Uri $wiUrl -Headers $headers
           } catch {
-            Write-Host "❌ Failed to fetch Work Item #$wiId: $_"
+            Write-Host "❌ Failed to fetch Work Item #${wiId}: $($_.Exception.Message)"
             continue
           }
 
           $prRelations = $wi.relations | Where-Object { $_.attributes.name -eq "Pull Request" }
 
           if (-not $prRelations) {
-            Write-Host "⚠️ No PRs linked to Work Item #$wiId"
+            Write-Host "⚠️ No PRs linked to Work Item #${wiId}"
             continue
           }
 
@@ -92,11 +92,11 @@ steps:
           }
 
           if (-not $allPRsApproved) {
-            Write-Host "❌ Removing Work Item #$wiId (not all PRs approved)"
+            Write-Host "❌ Removing Work Item #${wiId} (not all PRs approved)"
             continue
           }
 
-          Write-Host "✅ All PRs approved for Work Item #$wiId — collecting commits..."
+          Write-Host "✅ All PRs approved for Work Item #${wiId} — collecting commits..."
 
           foreach ($pr in $prRelations) {
             $prUrl = $pr.url
@@ -116,7 +116,6 @@ steps:
         $releaseBranch = "release/$fixVersion"
         Write-Host "`n🌿 Preparing release branch: $releaseBranch"
 
-        # Ensure repo is cloned
         if (-not (Test-Path ".git")) {
           git clone "$(Build.Repository.Uri)" repo
           Set-Location repo
@@ -132,7 +131,6 @@ steps:
           git checkout -b $releaseBranch origin/main
         }
 
-        # --- Step 4: Merge all approved commits ---
         foreach ($sha in $approvedCommits | Select-Object -Unique) {
           Write-Host "⬇️ Cherry-picking commit $sha"
           git cherry-pick $sha 2>$null || Write-Host "⚠️ Skipped commit $sha (already merged or conflict)"
