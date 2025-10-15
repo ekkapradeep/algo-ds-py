@@ -47,7 +47,8 @@ stages:
                 $body = @{
                   query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
                 } | ConvertTo-Json
-
+                Write-Host "workItemsUrl $workItemsUrl"
+                Write-Host "body $body"
                 $workItems = Invoke-RestMethod -Uri $workItemsUrl -Headers $headers -Method Post -Body $body
                 $ids = $workItems.workItems | ForEach-Object { $_.id }
 
