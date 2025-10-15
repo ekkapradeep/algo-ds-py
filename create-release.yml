@@ -33,31 +33,76 @@ stages:
                 $repo = "algo-ds-py"
                 $releaseBranch = "release/${fixVersion}"
                 $token = "$(System.AccessToken)"
-                $headers = @{ Authorization = "Bearer $token" }
+                $headers = @{ 
+                    Authorization = "Bearer $token"
+                    "Content-Type" = "application/json"
+                }
+
+                # --- CONNECTION TEST ---
+                try {
+                    Write-Host "##[section]Testing connection to Azure DevOps..."
+                    $projectUrl = "$orgUrl/$project/_apis/projects?api-version=7.0"
+                    $projectTest = Invoke-RestMethod -Uri $projectUrl -Method Get -Headers $headers
+                    Write-Host "✅ Successfully connected to project: $($projectTest.value.name)"
+                } catch {
+                    Write-Host "##[error]❌ Failed to connect to project: $($_.Exception.Message)"
+                    Write-Host "Please check:"
+                    Write-Host "1. Organization URL: $orgUrl"
+                    Write-Host "2. Project name: $project" 
+                    Write-Host "3. Access token permissions"
+                    Write-Host "4. Pipeline OAuth token scope"
+                    exit 1
+                }
 
                 # --- STEP 1: Fetch work items ---
-                Write-Host "🔍 Fetching work items with FixVersion = ${fixVersion}..."
+                Write-Host "##[section]🔍 Fetching work items with FixVersion = ${fixVersion}..."
                 $wiql = @{
-                  query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
+                    query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
                 } | ConvertTo-Json
 
                 $wiqlUrl = "$orgUrl/$project/_apis/wit/wiql?api-version=7.0"
-                $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
 
-                if (-not $wiqlResult.workItems) {
-                    Write-Host "⚠️ No work items found for FixVersion ${fixVersion}"
-                    exit 0
+                try {
+                    $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
+                    Write-Host "✅ WIQL query executed successfully"
+                    
+                    if (-not $wiqlResult.workItems) {
+                        Write-Host "⚠️ No work items found for FixVersion ${fixVersion}"
+                        Write-Host "WIQL Query used: $($wiql.query)"
+                        exit 0
+                    }
+                    
+                    Write-Host "📋 Found $($wiqlResult.workItems.Count) work items: $($wiqlResult.workItems.id -join ', ')"
+                } catch {
+                    Write-Host "##[error]❌ Failed to execute WIQL query: $($_.Exception.Message)"
+                    Write-Host "Response: $($_.Exception.Response)"
+                    
+                    # Try to get more details about the error
+                    try {
+                        $errorDetails = $_.ErrorDetails.Message | ConvertFrom-Json
+                        Write-Host "Error Details: $($errorDetails | ConvertTo-Json -Depth 3)"
+                    } catch {
+                        Write-Host "Could not parse error details"
+                    }
+                    exit 1
                 }
 
-                # --- STEP 2: Process work items ---
+                # --- STEP 2: Process work items with enhanced error handling ---
                 $finalWorkItems = @()
+                $processedCount = 0
 
                 foreach ($wi in $wiqlResult.workItems) {
                     $wiId = $wi.id
-                    $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?%24expand=relations&api-version=7.0"
+                    $processedCount++
+                    Write-Host "##[section]Processing Work Item #${wiId} ($processedCount of $($wiqlResult.workItems.Count))..."
+                    
+                    $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
 
                     try {
+                        Write-Host "Fetching details from: $relationsUrl"
                         $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
+                        Write-Host "✅ Successfully fetched work item #${wiId} - $($wiDetails.fields.'System.Title')"
+                        
                         $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
 
                         if (-not $prLinks) {
@@ -65,15 +110,28 @@ stages:
                             continue
                         }
 
+                        Write-Host "Found $($prLinks.Count) linked PR(s)"
                         $allApproved = $true
+                        
                         foreach ($prLink in $prLinks) {
                             if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
                                 $prId = $matches[1]
                                 $prApiUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId?api-version=7.0"
-                                $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
+                                Write-Host "  Checking PR #${prId}..."
+                                
+                                try {
+                                    $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
 
-                                if ($pr.status -ne "completed" -or $pr.mergeStatus -ne "succeeded") {
-                                    Write-Host "❌ PR #${prId} for Work Item #${wiId} is not approved or merged yet."
+                                    if ($pr.status -ne "completed" -or $pr.mergeStatus -ne "succeeded") {
+                                        Write-Host "  ❌ PR #${prId} for Work Item #${wiId} is not approved or merged yet."
+                                        Write-Host "     Status: $($pr.status), Merge Status: $($pr.mergeStatus)"
+                                        $allApproved = $false
+                                        break
+                                    } else {
+                                        Write-Host "  ✅ PR #${prId} is completed and merged"
+                                    }
+                                } catch {
+                                    Write-Host "  ❌ Failed to fetch PR #${prId}: $($_.Exception.Message)"
                                     $allApproved = $false
                                     break
                                 }
@@ -81,7 +139,7 @@ stages:
                         }
 
                         if ($allApproved) {
-                            Write-Host "✅ Work Item #${wiId} has all PRs approved."
+                            Write-Host "✅ Work Item #${wiId} has all PRs approved. Adding to release."
                             $finalWorkItems += $wiId
                         } else {
                             Write-Host "🚫 Skipping Work Item #${wiId} because not all PRs approved."
@@ -89,17 +147,34 @@ stages:
 
                     } catch {
                         $errMsg = $_.Exception.Message
-                        Write-Host "❌ Failed to fetch Work Item #${wiId}: ${errMsg}"
+                        Write-Host "##[error]❌ Failed to fetch Work Item #${wiId}: ${errMsg}"
+                        Write-Host "URL attempted: $relationsUrl"
+                        
+                        # Check if it's a 404 specifically
+                        if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq 'NotFound') {
+                            Write-Host "This work item might not exist or you don't have permission to access it."
+                        }
+                        
+                        # Continue with next work item instead of failing entire pipeline
+                        continue
                     }
                 }
 
                 if (-not $finalWorkItems) {
-                    Write-Host "⚠️ No work items qualify for release."
+                    Write-Host "##[warning]⚠️ No work items qualify for release."
+                    Write-Host "Processed $processedCount work items, but none had all PRs approved and merged."
                     exit 0
                 }
 
+                Write-Host "##[section]🎯 Qualified work items for release: $($finalWorkItems -join ', ')"
+
                 # --- STEP 3: Prepare release branch ---
-                Write-Host "🔧 Preparing release branch: ${releaseBranch}"
+                Write-Host "##[section]🔧 Preparing release branch: ${releaseBranch}"
+                
+                # Configure git
+                git config --global user.email "build@azure.dev"
+                git config --global user.name "Azure DevOps"
+                
                 git fetch origin
                 $branchExists = (git branch -r | Select-String "origin/${releaseBranch}")
 
@@ -115,27 +190,62 @@ stages:
                 }
 
                 # --- STEP 4: Merge approved PR commits ---
+                Write-Host "##[section]🔀 Merging approved PR commits into release branch..."
+                $mergeSuccess = $true
+
                 foreach ($wiId in $finalWorkItems) {
-                    Write-Host "🔗 Processing PRs for Work Item #${wiId}..."
-                    $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?%24expand=relations&api-version=7.0"
-                    $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
-                    $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
+                    Write-Host "Processing Work Item #${wiId}..."
+                    $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
+                    
+                    try {
+                        $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
+                        $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
 
-                    foreach ($prLink in $prLinks) {
-                        if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
-                            $prId = $matches[1]
-                            $prApiUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId?api-version=7.0"
-                            $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
+                        foreach ($prLink in $prLinks) {
+                            if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
+                                $prId = $matches[1]
+                                $prApiUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId?api-version=7.0"
+                                
+                                try {
+                                    $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
 
-                            if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
-                                $sourceBranch = $pr.sourceRefName.Replace("refs/heads/", "")
-                                Write-Host "🔀 Merging commits from branch: ${sourceBranch}"
-                                git fetch origin ${sourceBranch}
-                                git merge origin/${sourceBranch} --no-edit
+                                    if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
+                                        $sourceBranch = $pr.sourceRefName.Replace("refs/heads/", "")
+                                        Write-Host "  Merging commits from branch: ${sourceBranch}"
+                                        
+                                        git fetch origin ${sourceBranch}
+                                        $mergeResult = git merge origin/${sourceBranch} --no-edit
+                                        
+                                        if ($LASTEXITCODE -ne 0) {
+                                            Write-Host "##[warning]  ⚠️ Merge conflict occurred with ${sourceBranch}"
+                                            Write-Host "  Merge output: $mergeResult"
+                                            # Continue with next merge, don't fail immediately
+                                        } else {
+                                            Write-Host "  ✅ Successfully merged ${sourceBranch}"
+                                        }
+                                    }
+                                } catch {
+                                    Write-Host "##[warning]  ⚠️ Failed to process PR #${prId}: $($_.Exception.Message)"
+                                }
                             }
                         }
+                    } catch {
+                        Write-Host "##[warning]⚠️ Failed to process work item #${wiId} for merging: $($_.Exception.Message)"
                     }
                 }
 
+                # --- STEP 5: Push changes ---
+                Write-Host "##[section]📤 Pushing changes to remote..."
                 git push origin ${releaseBranch}
-                Write-Host "🎉 Release branch ${releaseBranch} updated successfully."
+                
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "##[section]🎉 Release branch ${releaseBranch} updated successfully!"
+                    Write-Host "##[section]📋 Summary:"
+                    Write-Host "   - Fix Version: ${fixVersion}"
+                    Write-Host "   - Work Items Processed: $processedCount"
+                    Write-Host "   - Work Items Included: $($finalWorkItems.Count)"
+                    Write-Host "   - Release Branch: ${releaseBranch}"
+                } else {
+                    Write-Host "##[error]❌ Failed to push release branch"
+                    exit 1
+                }
