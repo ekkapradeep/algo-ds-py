@@ -9,9 +9,9 @@ pool:
   vmImage: 'ubuntu-latest'
 
 variables:
-  org: "YOUR_ORG"
-  project: "YOUR_PROJECT"
-  repo: "YOUR_REPO"
+  org: "pradeepekka"
+  project: "Algo-ds-Py"
+  repo: "algo-ds-py"
   sourceBranch: "develop"
 
 stages:
