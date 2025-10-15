@@ -4,7 +4,7 @@ trigger:
       - main
 
 variables:
-  fixVersion: '1.0.0'  # Set dynamically via pipeline variables or parameters
+  fixVersion: '1.0.0'  # Can be dynamically set via pipeline variables
 
 stages:
   - stage: ReleaseBranch
@@ -15,6 +15,9 @@ stages:
         pool:
           vmImage: 'ubuntu-latest'
         steps:
+          - checkout: self
+            persistCredentials: true  # ✅ Needed for System.AccessToken
+
           - task: PowerShell@2
             displayName: "Create/Update Release Branch"
             inputs:
@@ -51,14 +54,14 @@ stages:
 
                 foreach ($wi in $wiqlResult.workItems) {
                     $wiId = $wi.id
-                    $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
+                    $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?%24expand=relations&api-version=7.0"
 
                     try {
                         $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
                         $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
 
                         if (-not $prLinks) {
-                            Write-Host "⚠️ Work item #${wiId} has no linked PRs. Skipping..."
+                            Write-Host "⚠️ Work Item #${wiId} has no linked PRs. Skipping..."
                             continue
                         }
 
@@ -97,7 +100,6 @@ stages:
 
                 # --- STEP 3: Prepare release branch ---
                 Write-Host "🔧 Preparing release branch: ${releaseBranch}"
-
                 git fetch origin
                 $branchExists = (git branch -r | Select-String "origin/${releaseBranch}")
 
@@ -115,29 +117,23 @@ stages:
                 # --- STEP 4: Merge approved PR commits ---
                 foreach ($wiId in $finalWorkItems) {
                     Write-Host "🔗 Processing PRs for Work Item #${wiId}..."
-                    $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
-                    try {
-                        $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
-                        $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
+                    $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?%24expand=relations&api-version=7.0"
+                    $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
+                    $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
 
-                        foreach ($prLink in $prLinks) {
-                            if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
-                                $prId = $matches[1]
-                                $prApiUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId?api-version=7.0"
-                                $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
+                    foreach ($prLink in $prLinks) {
+                        if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
+                            $prId = $matches[1]
+                            $prApiUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId?api-version=7.0"
+                            $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
 
-                                if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
-                                    $sourceBranch = $pr.sourceRefName.Replace("refs/heads/", "")
-                                    Write-Host "🔀 Merging commits from branch: ${sourceBranch}"
-                                    git fetch origin ${sourceBranch}
-                                    git merge origin/${sourceBranch} --no-edit
-                                }
+                            if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
+                                $sourceBranch = $pr.sourceRefName.Replace("refs/heads/", "")
+                                Write-Host "🔀 Merging commits from branch: ${sourceBranch}"
+                                git fetch origin ${sourceBranch}
+                                git merge origin/${sourceBranch} --no-edit
                             }
                         }
-
-                    } catch {
-                        $errMsg = $_.Exception.Message
-                        Write-Host "❌ Failed to process PRs for Work Item #${wiId}: ${errMsg}"
                     }
                 }
 
