@@ -15,6 +15,9 @@ stages:
         pool:
           vmImage: 'ubuntu-latest'
         steps:
+          - checkout: self
+            persistCredentials: true  # <-- allows $(System.AccessToken) to be used
+
           - task: PowerShell@2
             displayName: "Create/Update Release Branch"
             inputs:
@@ -22,27 +25,32 @@ stages:
               pwsh: true
               script: |
                 $fixVersion = "${{ variables.fixVersion }}"
-                Write-Host "🚀 Starting release branch update for FixVersion: ${fixVersion}"
+                Write-Host "🚀 Starting release branch update for FixVersion: $fixVersion"
 
                 # --- CONFIG ---
                 $orgUrl = "https://dev.azure.com/pradeepekka"
                 $project = "Algo-ds-Py"
                 $repo = "algo-ds-py"
-                $releaseBranch = "release/${fixVersion}"
+                $releaseBranch = "release/$fixVersion"
                 $token = "$(System.AccessToken)"
                 $headers = @{ Authorization = "Bearer $token" }
 
                 # --- STEP 1: Fetch work items ---
-                Write-Host "🔍 Fetching work items with FixVersion = ${fixVersion}..."
+                Write-Host "🔍 Fetching work items with FixVersion = $fixVersion..."
                 $wiql = @{
                   query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
                 } | ConvertTo-Json
 
                 $wiqlUrl = "$orgUrl/$project/_apis/wit/wiql?api-version=7.0"
-                $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
+                try {
+                  $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
+                } catch {
+                  Write-Host "❌ Failed to fetch work items: $($_.Exception.Message)"
+                  exit 1
+                }
 
                 if (-not $wiqlResult.workItems) {
-                    Write-Host "⚠️ No work items found for FixVersion ${fixVersion}"
+                    Write-Host "⚠️ No work items found for FixVersion $fixVersion"
                     exit 0
                 }
 
@@ -58,7 +66,7 @@ stages:
                         $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
 
                         if (-not $prLinks) {
-                            Write-Host "⚠️ Work item #${wiId} has no linked PRs. Skipping..."
+                            Write-Host "⚠️ Work item #$wiId has no linked PRs. Skipping..."
                             continue
                         }
 
@@ -70,7 +78,7 @@ stages:
                                 $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
 
                                 if ($pr.status -ne "completed" -or $pr.mergeStatus -ne "succeeded") {
-                                    Write-Host "❌ PR #${prId} for Work Item #${wiId} is not approved or merged yet."
+                                    Write-Host "❌ PR #$prId for Work Item #$wiId is not approved or merged yet."
                                     $allApproved = $false
                                     break
                                 }
@@ -78,14 +86,14 @@ stages:
                         }
 
                         if ($allApproved) {
-                            Write-Host "✅ Work Item #${wiId} has all PRs approved."
+                            Write-Host "✅ Work Item #$wiId has all PRs approved."
                             $finalWorkItems += $wiId
                         } else {
-                            Write-Host "🚫 Skipping Work Item #${wiId} because not all PRs approved."
+                            Write-Host "🚫 Skipping Work Item #$wiId because not all PRs approved."
                         }
 
                     } catch {
-                        Write-Host "❌ Failed to fetch Work Item #${wiId}: $_"
+                        Write-Host "❌ Failed to fetch Work Item #$wiId: $($_.Exception.Message)"
                     }
                 }
 
@@ -95,25 +103,25 @@ stages:
                 }
 
                 # --- STEP 3: Prepare release branch ---
-                Write-Host "🔧 Preparing release branch: ${releaseBranch}"
+                Write-Host "🔧 Preparing release branch: $releaseBranch"
 
                 git fetch origin
-                $branchExists = (git branch -r | Select-String "origin/${releaseBranch}")
+                $branchExists = (git branch -r | Select-String "origin/$releaseBranch")
 
                 if ($branchExists) {
                     Write-Host "📦 Release branch exists. Updating..."
-                    git checkout ${releaseBranch}
-                    git pull origin ${releaseBranch}
+                    git checkout $releaseBranch
+                    git pull origin $releaseBranch
                 } else {
                     Write-Host "🌱 Creating new release branch from main..."
                     git checkout main
                     git pull origin main
-                    git checkout -b ${releaseBranch}
+                    git checkout -b $releaseBranch
                 }
 
                 # --- STEP 4: Merge approved PR commits ---
                 foreach ($wiId in $finalWorkItems) {
-                    Write-Host "🔗 Processing PRs for Work Item #${wiId}..."
+                    Write-Host "🔗 Processing PRs for Work Item #$wiId..."
                     $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
                     $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
                     $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
@@ -126,13 +134,13 @@ stages:
 
                             if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
                                 $sourceBranch = $pr.sourceRefName.Replace("refs/heads/", "")
-                                Write-Host "🔀 Merging commits from branch: ${sourceBranch}"
-                                git fetch origin ${sourceBranch}
-                                git merge origin/${sourceBranch} --no-edit
+                                Write-Host "🔀 Merging commits from branch: $sourceBranch"
+                                git fetch origin $sourceBranch
+                                git merge origin/$sourceBranch --no-edit
                             }
                         }
                     }
                 }
 
-                git push origin ${releaseBranch}
-                Write-Host "🎉 Release branch ${releaseBranch} updated successfully."
+                git push origin $releaseBranch
+                Write-Host "🎉 Release branch $releaseBranch updated successfully."
