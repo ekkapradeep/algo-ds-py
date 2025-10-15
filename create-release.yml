@@ -19,11 +19,17 @@ steps:
       targetType: "inline"
       script: |
         param(
-          [string]$fixVersion = "$(fixVersion)",
-          [string]$org = "$(System.CollectionUri)",
-          [string]$project = "$(System.TeamProject)",
-          [string]$repo = "$(Build.Repository.Name)"
+          [string]$fixVersion,
+          [string]$org,
+          [string]$project,
+          [string]$repo
         )
+
+        # Assign from pipeline variables
+        $fixVersion = "$(fixVersion)"
+        $org = "$(System.CollectionUri)"
+        $project = "$(System.TeamProject)"
+        $repo = "$(Build.Repository.Name)"
 
         if (-not $fixVersion) {
           Write-Error "❌ A value for the 'fixVersion' parameter must be provided."
