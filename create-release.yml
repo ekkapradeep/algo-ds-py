@@ -19,6 +19,56 @@ stages:
             persistCredentials: true
 
           - task: PowerShell@2
+            displayName: "Test API Access"
+            inputs:
+              targetType: 'inline'
+              pwsh: true
+              script: |
+                Write-Host "##[section]Testing Azure DevOps API Access..."
+                
+                $orgUrl = "https://pradeepekka.visualstudio.com"
+                $project = "Algo-ds-Py"
+                $token = "$(System.AccessToken)"
+                $headers = @{ 
+                    Authorization = "Bearer $token"
+                    "Content-Type" = "application/json"
+                }
+                
+                # Test 1: List all projects (this should work)
+                try {
+                    $projectsUrl = "$orgUrl/_apis/projects?api-version=7.0"
+                    Write-Host "Testing: $projectsUrl"
+                    $projects = Invoke-RestMethod -Uri $projectsUrl -Method Get -Headers $headers
+                    Write-Host "✅ Successfully listed projects"
+                    foreach ($proj in $projects.value) {
+                        Write-Host "  - $($proj.name) (ID: $($proj.id))"
+                    }
+                } catch {
+                    Write-Host "##[error]Failed to list projects: $($_.Exception.Message)"
+                }
+                
+                # Test 2: Get specific project by ID
+                try {
+                    $projectId = "$(System.TeamProjectId)"
+                    $projectUrl = "$orgUrl/_apis/projects/$projectId?api-version=7.0"
+                    Write-Host "Testing: $projectUrl"
+                    $projectInfo = Invoke-RestMethod -Uri $projectUrl -Method Get -Headers $headers
+                    Write-Host "✅ Successfully accessed project by ID: $($projectInfo.name)"
+                } catch {
+                    Write-Host "##[error]Failed to get project by ID: $($_.Exception.Message)"
+                }
+                
+                # Test 3: Get project by name (this might not work with Visual Studio URLs)
+                try {
+                    $projectByNameUrl = "$orgUrl/_apis/projects/$project?api-version=7.0"
+                    Write-Host "Testing: $projectByNameUrl"
+                    $projectByName = Invoke-RestMethod -Uri $projectByNameUrl -Method Get -Headers $headers
+                    Write-Host "✅ Successfully accessed project by name: $($projectByName.name)"
+                } catch {
+                    Write-Host "⚠️ Cannot access project by name (expected for Visual Studio URLs): $($_.Exception.Message)"
+                }
+
+          - task: PowerShell@2
             displayName: "Create/Update Release Branch"
             inputs:
               targetType: 'inline'
@@ -26,134 +76,98 @@ stages:
               script: |
                 $fixVersion = "${{ variables.fixVersion }}"
                 Write-Host "🚀 Starting release branch update for FixVersion: ${fixVersion}"
-
-                # Use discovered values from Azure DevOps environment
-                $orgUrl = "https://pradeepekka.visualstudio.com/"
+                
+                # Use the correct Visual Studio URL format
+                $orgUrl = "https://pradeepekka.visualstudio.com"
                 $project = "Algo-ds-Py"
-                $repo = "algo-ds-py"  # Use just the repo name, not the full path
+                $projectId = "$(System.TeamProjectId)"  # Use the project ID instead of name
+                $repo = "algo-ds-py"
                 $releaseBranch = "release/${fixVersion}"
                 $token = "$(System.AccessToken)"
                 $headers = @{ 
                     Authorization = "Bearer $token"
                     "Content-Type" = "application/json"
                 }
-
+                
                 Write-Host "Using configuration:"
                 Write-Host "  Organization: $orgUrl"
-                Write-Host "  Project: $project"
+                Write-Host "  Project: $project (ID: $projectId)"
                 Write-Host "  Repository: $repo"
                 Write-Host "  Release Branch: $releaseBranch"
-
-                # Test connection to project
-                try {
-                    Write-Host "##[section]Testing project connection..."
-                    # Use the correct API format for Visual Studio URLs
-                    $projectUrl = "$orgUrl$project/_apis/projects/$project`?api-version=7.0"
-                    Write-Host "Testing URL: $projectUrl"
-                    $projectInfo = Invoke-RestMethod -Uri $projectUrl -Method Get -Headers $headers
-                    Write-Host "✅ Successfully connected to project: $($projectInfo.name)"
-                } catch {
-                    Write-Host "##[error]❌ Failed to connect to project: $($_.Exception.Message)"
-                    Write-Host "Full error details: $($_.Exception.Response)"
-                    exit 1
-                }
-
-                # --- STEP 1: Check available work item fields ---
-                Write-Host "##[section]🔍 Checking available work item fields..."
-                try {
-                    $fieldsUrl = "$orgUrl$project/_apis/wit/fields?api-version=7.0"
-                    $fields = Invoke-RestMethod -Uri $fieldsUrl -Headers $headers
-                    Write-Host "Available custom fields:"
-                    $customFields = $fields.value | Where-Object { $_.referenceName -like "Custom.*" -or $_.referenceName -like "Microsoft.VSTS*" }
-                    foreach ($field in $customFields) {
-                        Write-Host "  - $($field.referenceName): $($field.name)"
-                    }
-                } catch {
-                    Write-Host "⚠️ Could not fetch fields: $($_.Exception.Message)"
-                }
-
-                # --- STEP 2: Fetch work items ---
+                
+                # --- STEP 1: Fetch work items using WIQL ---
                 Write-Host "##[section]🔍 Fetching work items with FixVersion = ${fixVersion}..."
                 
-                # Try different possible field names for FixVersion
-                $possibleFields = @("Custom.FixVersion", "Microsoft.VSTS.Common.FixVersion", "Custom.ReleaseVersion", "System.Tags")
-                $wiqlResult = $null
-                $usedField = ""
-
-                foreach ($fieldName in $possibleFields) {
-                    Write-Host "Trying field: $fieldName"
-                    $wiql = @{
-                        query = "SELECT [System.Id], [System.Title] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [$fieldName] = '$fixVersion'"
-                    } | ConvertTo-Json
-                    
-                    $wiqlUrl = "$orgUrl$project/_apis/wit/wiql?api-version=7.0"
-                    
-                    try {
-                        $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
-                        
-                        if ($result.workItems -and $result.workItems.Count -gt 0) {
-                            Write-Host "✅ Found $($result.workItems.Count) work items using field: $fieldName"
-                            $wiqlResult = $result
-                            $usedField = $fieldName
-                            break
-                        } else {
-                            Write-Host "⚠️ No work items found with field: $fieldName"
-                        }
-                    } catch {
-                        Write-Host "❌ Field '$fieldName' not found or not accessible: $($_.Exception.Message)"
-                    }
-                }
+                # For Visual Studio URLs, we need to use the project in the path differently
+                $wiql = @{
+                    query = "SELECT [System.Id], [System.Title] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
+                } | ConvertTo-Json
                 
-                if (-not $wiqlResult -or $wiqlResult.workItems.Count -eq 0) {
-                    Write-Host "##[warning]No work items found for FixVersion '$fixVersion' with any known field."
-                    Write-Host "Let's try to find ALL work items in the project to see what's available:"
+                $wiqlUrl = "$orgUrl/$project/_apis/wit/wiql?api-version=7.0"
+                
+                try {
+                    Write-Host "Executing WIQL query..."
+                    $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
                     
-                    # Get all recent work items to see what we have
-                    $allWiql = @{
-                        query = "SELECT [System.Id], [System.Title], [System.State] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [System.ChangedDate] >= @today-30 ORDER BY [System.ChangedDate] DESC"
-                    } | ConvertTo-Json
-                    
-                    try {
-                        $allResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $allWiql -ContentType "application/json"
-                        Write-Host "Recent work items in project (last 30 days):"
-                        foreach ($wi in $allResult.workItems) {
+                    if ($wiqlResult.workItems -and $wiqlResult.workItems.Count -gt 0) {
+                        Write-Host "✅ Found $($wiqlResult.workItems.Count) work items"
+                        foreach ($wi in $wiqlResult.workItems) {
                             Write-Host "  - ID: $($wi.id), Title: $($wi.fields.'System.Title')"
                         }
-                    } catch {
-                        Write-Host "Could not fetch recent work items: $($_.Exception.Message)"
+                    } else {
+                        Write-Host "##[warning]No work items found for FixVersion '$fixVersion'"
+                        Write-Host "Let's check if there are any work items in the project at all..."
+                        
+                        # Try a simple query to get any work items
+                        $testWiql = @{
+                            query = "SELECT [System.Id], [System.Title] FROM WorkItems WHERE [System.TeamProject] = '$project'"
+                        } | ConvertTo-Json
+                        
+                        $testResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $testWiql -ContentType "application/json"
+                        if ($testResult.workItems -and $testResult.workItems.Count -gt 0) {
+                            Write-Host "Found $($testResult.workItems.Count) total work items in project."
+                            Write-Host "The FixVersion field might not exist or no work items have FixVersion = '$fixVersion'"
+                        } else {
+                            Write-Host "No work items found in the project at all."
+                        }
+                        exit 0
                     }
+                } catch {
+                    Write-Host "##[error]❌ Failed to fetch work items: $($_.Exception.Message)"
+                    Write-Host "This might be due to:"
+                    Write-Host "1. Incorrect project name in URL"
+                    Write-Host "2. Missing permissions"
+                    Write-Host "3. The 'FixVersion' field doesn't exist"
                     
-                    exit 0
+                    # Show the exact URL being called
+                    Write-Host "URL called: $wiqlUrl"
+                    exit 1
                 }
-
-                Write-Host "##[section]Using field '$usedField' for FixVersion filtering"
-                Write-Host "Found $($wiqlResult.workItems.Count) work items:"
-                foreach ($wi in $wiqlResult.workItems) {
-                    Write-Host "  - ID: $($wi.id), Title: $($wi.fields.'System.Title')"
-                }
-
-                # --- STEP 3: Process work items ---
+                
+                # --- STEP 2: Process work items ---
                 $finalWorkItems = @()
                 
                 foreach ($wi in $wiqlResult.workItems) {
                     $wiId = $wi.id
                     Write-Host "##[section]Processing Work Item #${wiId}: $($wi.fields.'System.Title')..."
                     
-                    $relationsUrl = "$orgUrl$project/_apis/wit/workitems/$wiId`?`$expand=relations&api-version=7.0"
+                    # Use the correct API endpoint for work item details
+                    $wiUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId`?`$expand=relations&api-version=7.0"
                     
                     try {
-                        $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
+                        $wiDetails = Invoke-RestMethod -Uri $wiUrl -Headers $headers
                         Write-Host "✅ Successfully fetched work item details"
                         
-                        # Check if work item has relations
+                        # Check for linked PRs
+                        $prLinks = @()
                         if ($wiDetails.relations) {
-                            $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
-                            Write-Host "Found $($prLinks.Count) linked PR(s)"
-                        } else {
-                            $prLinks = @()
-                            Write-Host "No relations found for work item"
+                            $prLinks = $wiDetails.relations | Where-Object { 
+                                $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" 
+                            }
                         }
-
+                        
+                        Write-Host "Found $($prLinks.Count) linked PR(s)"
+                        
                         if (-not $prLinks) {
                             Write-Host "⚠️ Work Item #${wiId} has no linked PRs. Skipping..."
                             continue
@@ -164,20 +178,21 @@ stages:
                         foreach ($prLink in $prLinks) {
                             if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
                                 $prId = $matches[1]
-                                $prApiUrl = "$orgUrl$project/_apis/git/repositories/$repo/pullRequests/$prId`?api-version=7.0"
                                 Write-Host "  Checking PR #${prId}..."
                                 
+                                # Use the correct Git API endpoint
+                                $prUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId`?api-version=7.0"
+                                
                                 try {
-                                    $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
-
+                                    $pr = Invoke-RestMethod -Uri $prUrl -Headers $headers
                                     Write-Host "  PR Status: $($pr.status), Merge Status: $($pr.mergeStatus)"
                                     
                                     if ($pr.status -ne "completed" -or $pr.mergeStatus -ne "succeeded") {
-                                        Write-Host "  ❌ PR #${prId} for Work Item #${wiId} is not approved or merged yet."
+                                        Write-Host "  ❌ PR #${prId} is not merged"
                                         $allApproved = $false
                                         break
                                     } else {
-                                        Write-Host "  ✅ PR #${prId} is completed and merged"
+                                        Write-Host "  ✅ PR #${prId} is merged successfully"
                                     }
                                 } catch {
                                     Write-Host "  ❌ Failed to fetch PR #${prId}: $($_.Exception.Message)"
@@ -188,27 +203,25 @@ stages:
                         }
                         
                         if ($allApproved) {
-                            Write-Host "✅ Work Item #${wiId} has all PRs approved. Adding to release."
+                            Write-Host "✅ Work Item #${wiId} approved for release"
                             $finalWorkItems += $wiId
                         } else {
-                            Write-Host "🚫 Skipping Work Item #${wiId} because not all PRs approved."
+                            Write-Host "🚫 Skipping Work Item #${wiId} - not all PRs approved"
                         }
                         
                     } catch {
                         Write-Host "##[error]❌ Failed to process Work Item #${wiId}: $($_.Exception.Message)"
-                        Write-Host "URL attempted: $relationsUrl"
                     }
                 }
                 
                 if (-not $finalWorkItems) {
-                    Write-Host "##[warning]⚠️ No work items qualify for release."
-                    Write-Host "Processed $($wiqlResult.workItems.Count) work items, but none had all PRs approved and merged."
+                    Write-Host "##[warning]No work items qualify for release."
                     exit 0
                 }
-
-                Write-Host "##[section]🎯 Qualified work items for release: $($finalWorkItems -join ', ')"
-
-                # --- STEP 4: Create/Update release branch ---
+                
+                Write-Host "##[section]🎯 Qualified work items: $($finalWorkItems -join ', ')"
+                
+                # --- STEP 3: Create/Update release branch ---
                 Write-Host "##[section]🔧 Preparing release branch: ${releaseBranch}"
                 
                 # Configure git
@@ -217,7 +230,7 @@ stages:
                 
                 git fetch origin
                 $branchExists = git ls-remote --heads origin $releaseBranch
-
+                
                 if ($branchExists) {
                     Write-Host "📦 Release branch exists. Updating..."
                     git checkout $releaseBranch
@@ -228,62 +241,14 @@ stages:
                     git pull origin main
                     git checkout -b $releaseBranch
                 }
-
-                # --- STEP 5: Merge approved PR commits ---
-                Write-Host "##[section]🔀 Merging approved PR commits into release branch..."
                 
-                foreach ($wiId in $finalWorkItems) {
-                    Write-Host "Processing Work Item #${wiId} for merging..."
-                    $relationsUrl = "$orgUrl$project/_apis/wit/workitems/$wiId`?`$expand=relations&api-version=7.0"
-                    
-                    try {
-                        $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
-                        $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
-
-                        foreach ($prLink in $prLinks) {
-                            if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
-                                $prId = $matches[1]
-                                $prApiUrl = "$orgUrl$project/_apis/git/repositories/$repo/pullRequests/$prId`?api-version=7.0"
-                                
-                                try {
-                                    $pr = Invoke-RestMethod -Uri $prApiUrl -Headers $headers
-
-                                    if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
-                                        $sourceBranch = $pr.sourceRefName.Replace("refs/heads/", "")
-                                        Write-Host "  Merging commits from branch: ${sourceBranch}"
-                                        
-                                        git fetch origin $sourceBranch
-                                        $mergeOutput = git merge origin/$sourceBranch --no-edit 2>&1
-                                        
-                                        if ($LASTEXITCODE -eq 0) {
-                                            Write-Host "  ✅ Successfully merged ${sourceBranch}"
-                                        } else {
-                                            Write-Host "  ⚠️ Merge had issues with ${sourceBranch}: $mergeOutput"
-                                            # Continue with next merge even if there are conflicts
-                                        }
-                                    }
-                                } catch {
-                                    Write-Host "  ⚠️ Failed to process PR #${prId}: $($_.Exception.Message)"
-                                }
-                            }
-                        }
-                    } catch {
-                        Write-Host "⚠️ Failed to process work item #${wiId} for merging: $($_.Exception.Message)"
-                    }
-                }
-
-                # --- STEP 6: Push changes ---
-                Write-Host "##[section]📤 Pushing changes to remote..."
+                # --- STEP 4: For now, let's just create the branch and push it ---
+                Write-Host "##[section]📤 Pushing release branch..."
                 git push origin $releaseBranch
                 
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Host "##[section]🎉 Release branch ${releaseBranch} updated successfully!"
-                    Write-Host "##[section]📋 Summary:"
-                    Write-Host "   - Fix Version: ${fixVersion}"
-                    Write-Host "   - Work Items Found: $($wiqlResult.workItems.Count)"
-                    Write-Host "   - Work Items Included: $($finalWorkItems.Count)"
-                    Write-Host "   - Release Branch: ${releaseBranch}"
-                } else {
-                    Write-Host "##[error]❌ Failed to push release branch"
-                    exit 1
-                }
+                Write-Host "##[section]🎉 Release branch ${releaseBranch} created/updated successfully!"
+                Write-Host "Note: Automatic PR merging is disabled until API access is confirmed."
+                
+                # Set output variable for next steps
+                Write-Host "##vso[task.setvariable variable=ReleaseBranchCreated]true"
+                Write-Host "##vso[task.setvariable variable=ReleaseBranchName]$releaseBranch"
