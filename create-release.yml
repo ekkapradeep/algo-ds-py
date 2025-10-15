@@ -26,11 +26,9 @@ stages:
             displayName: "Create or Update Release Branch for FixVersion"
             inputs:
               targetType: 'inline'
+              pwsh: true
               script: |
-                param(
-                    [string]$fixVersion
-                )
-
+                $fixVersion = "$(fixVersion)"
                 Write-Host "🚀 Starting release branch update for FixVersion: $fixVersion"
 
                 # --- CONFIG ---
@@ -55,7 +53,7 @@ stages:
                     exit 0
                 }
 
-                # --- STEP 2: Process each work item ---
+                # --- STEP 2: Process work items ---
                 $finalWorkItems = @()
 
                 foreach ($wi in $wiqlResult.workItems) {
@@ -72,7 +70,6 @@ stages:
                         }
 
                         $allApproved = $true
-
                         foreach ($prLink in $prLinks) {
                             if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
                                 $prId = $matches[1]
@@ -147,5 +144,3 @@ stages:
                 git push origin $releaseBranch
                 Write-Host "🎉 Release branch $releaseBranch updated successfully."
 
-            env:
-              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
