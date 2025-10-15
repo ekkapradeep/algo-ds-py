@@ -45,7 +45,7 @@ stages:
                 Write-Host "🔍 Fetching work items with FixVersion = $fixVersion..."
                 $workItemsUrl = "https://dev.azure.com/$org/$project/_apis/wit/wiql?api-version=7.0"
                 $body = @{
-                  query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.Fix Version] = '$fixVersion'"
+                  query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
                 } | ConvertTo-Json
                 Write-Host "workItemsUrl $workItemsUrl"
                 Write-Host "body $body"
