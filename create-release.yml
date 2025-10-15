@@ -1,61 +1,68 @@
-trigger: none
-
-parameters:
-  - name: fixVersion
-    displayName: "Fix Version"
-    type: string
-    default: "1.0.0"
+trigger:
+  branches:
+    include:
+      - main
 
 variables:
-  system.debug: true
+  fixVersion: "1.2.3"   # Update this value or override at queue time
 
 stages:
-  - stage: CreateOrUpdateReleaseBranch
-    displayName: "Create or Update Release Branch for FixVersion"
+  - stage: ReleaseBranch
+    displayName: "Create/Update Release Branch"
     jobs:
-      - job: UpdateReleaseBranch
-        displayName: "Process FixVersion Work Items and PRs"
+      - job: CreateReleaseBranch
+        displayName: "Create or Update Release Branch"
         pool:
-          vmImage: ubuntu-latest
-
+          vmImage: 'ubuntu-latest'
         steps:
           - checkout: self
-            persistCredentials: true
+            persistCredentials: true  # Required for git push using system token
 
           - task: PowerShell@2
-            displayName: "Create or Update Release Branch for FixVersion"
+            displayName: "Create/Update Release Branch for FixVersion"
             inputs:
               targetType: 'inline'
               pwsh: true
               script: |
+                # =========================================
+                # Azure DevOps Release Branch Automation
+                # =========================================
+
                 $fixVersion = "$(fixVersion)"
+
+                if ([string]::IsNullOrWhiteSpace($fixVersion)) {
+                    Write-Error "❌ The pipeline variable 'fixVersion' is not set. Please provide a value."
+                    exit 1
+                }
+
                 Write-Host "🚀 Starting release branch update for FixVersion: $fixVersion"
 
-                # --- CONFIG ---
-                $orgUrl = "https://dev.azure.com/pradeepekka"
-                $project = "Algo-ds-Py"
-                $repo = "algo-ds-py"
+                $orgUrl = "https://dev.azure.com/$(System.TeamProject)"
+                $project = "$(System.TeamProject)"
+                $repo = "$(Build.Repository.Name)"
                 $releaseBranch = "release/$fixVersion"
                 $token = "$(System.AccessToken)"
                 $headers = @{ Authorization = "Bearer $token" }
 
-                # --- STEP 1: Fetch work items ---
-                Write-Host "🔍 Fetching work items with FixVersion = $fixVersion..."
+                # Fetch work items
                 $wiql = @{
-                  query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
+                    query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
                 } | ConvertTo-Json
 
                 $wiqlUrl = "$orgUrl/$project/_apis/wit/wiql?api-version=7.0"
-                $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
+                try {
+                    $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql -ContentType "application/json"
+                } catch {
+                    Write-Error "❌ Failed to fetch work items: $_"
+                    exit 1
+                }
 
                 if (-not $wiqlResult.workItems) {
                     Write-Host "⚠️ No work items found for FixVersion $fixVersion"
                     exit 0
                 }
 
-                # --- STEP 2: Process work items ---
                 $finalWorkItems = @()
-
                 foreach ($wi in $wiqlResult.workItems) {
                     $wiId = $wi.id
                     $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
@@ -92,7 +99,7 @@ stages:
                         }
 
                     } catch {
-                        Write-Host "❌ Failed to fetch Work Item `${wiId}: $_"
+                        Write-Host "❌ Failed to fetch Work Item #$wiId: $_"
                     }
                 }
 
@@ -101,9 +108,7 @@ stages:
                     exit 0
                 }
 
-                # --- STEP 3: Prepare release branch ---
-                Write-Host "🔧 Preparing release branch: $releaseBranch"
-
+                # Prepare release branch
                 git fetch origin
                 $branchExists = (git branch -r | Select-String "origin/$releaseBranch")
 
@@ -118,9 +123,9 @@ stages:
                     git checkout -b $releaseBranch
                 }
 
-                # --- STEP 4: Merge approved PR commits ---
+                # Merge PRs
                 foreach ($wiId in $finalWorkItems) {
-                    Write-Host "🔗 Fetching PRs for Work Item #$wiId..."
+                    Write-Host "🔗 Processing PRs for Work Item #$wiId..."
                     $relationsUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
                     $wiDetails = Invoke-RestMethod -Uri $relationsUrl -Headers $headers
                     $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
@@ -141,6 +146,8 @@ stages:
                     }
                 }
 
+                # Push release branch
                 git push origin $releaseBranch
                 Write-Host "🎉 Release branch $releaseBranch updated successfully."
-
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
