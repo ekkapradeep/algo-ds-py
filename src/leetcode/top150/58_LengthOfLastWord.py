@@ -4,3 +4,5 @@ def lengthOfLastWord(s: str) -> int:
     
     # Return length of last word
     return len(words[-1])
+
+print(lengthOfLastWord("Hello World"))
