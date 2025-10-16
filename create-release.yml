@@ -8,7 +8,7 @@ variables:
 
 stages:
   - stage: ReleaseBranch
-    displayName: "Create/Update Release Branch"
+    displayName: "Create/Update Release Branch with Cherry-Picked Commits"
     jobs:
       - job: CreateReleaseBranch
         displayName: "Create or Update Release Branch for FixVersion"
@@ -30,86 +30,118 @@ stages:
 
                 Write-Host "🚀 Starting release branch update for FixVersion: ${fixVersion}"
 
-                # === Configuration ===
+                # --- CONFIGURATION ---
                 $orgUrl = "https://pradeepekka.visualstudio.com"
                 $project = "Algo-ds-Py"
                 $repo = "algo-ds-py"
                 $releaseBranch = "release/${fixVersion}"
                 $token = "$(System.AccessToken)"
-                $headers = @{ 
-                    Authorization = "Bearer $token"
-                    "Content-Type" = "application/json"
+
+                $headers = @{
+                  Authorization = "Bearer $token"
+                  "Content-Type" = "application/json"
                 }
 
-                # === STEP 1: Fetch Work Items ===
-                Write-Host "##[section]🔍 Fetching work items for FixVersion: ${fixVersion}"
+                Write-Host "Configuration:"
+                Write-Host "  Org: $orgUrl"
+                Write-Host "  Project: $project"
+                Write-Host "  Repo: $repo"
+                Write-Host "  Release Branch: $releaseBranch"
+
+                # --- STEP 1: Get Work Items for FixVersion ---
+                Write-Host "##[section]🔍 Fetching Work Items for FixVersion = ${fixVersion}..."
+
                 $wiql = @{
-                    query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
+                  query = "SELECT [System.Id], [System.Title] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [Custom.FixVersion] = '$fixVersion'"
                 } | ConvertTo-Json
 
                 $wiqlUrl = "$orgUrl/$project/_apis/wit/wiql?api-version=7.0"
-
                 try {
-                    $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql
-                    if (-not $wiqlResult.workItems) {
-                        Write-Host "##[warning]No work items found for FixVersion '$fixVersion'"
-                        exit 0
-                    }
-                    $workItemIds = $wiqlResult.workItems | ForEach-Object { $_.id }
-                    Write-Host "✅ Found work items: $($workItemIds -join ', ')"
+                  $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers -Body $wiql
                 } catch {
-                    Write-Host "##[error]Failed to fetch work items: $($_.Exception.Message)"
-                    exit 1
+                  Write-Host "##[error]Failed to fetch work items: $($_.Exception.Message)"
+                  exit 1
                 }
 
-                # === STEP 2: Collect PRs and Commits ===
+                if (-not $wiqlResult.workItems -or $wiqlResult.workItems.Count -eq 0) {
+                  Write-Host "⚠️ No work items found for FixVersion '${fixVersion}'."
+                  exit 0
+                }
+
+                Write-Host "✅ Found $($wiqlResult.workItems.Count) Work Item(s)."
+
+                # --- STEP 2: Validate linked PRs ---
+                $qualifiedWorkItems = @()
                 $cherryPickCommits = @()
 
-                foreach ($wiId in $workItemIds) {
-                    Write-Host "##[section]📦 Processing Work Item #$wiId"
+                foreach ($wi in $wiqlResult.workItems) {
+                  $wiId = $wi.id
+                  Write-Host "##[section]Processing Work Item #${wiId}..."
 
-                    $wiUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
-                    try {
-                        $wi = Invoke-RestMethod -Uri $wiUrl -Headers $headers
-                        $prLinks = $wi.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
-                        if (-not $prLinks) {
-                            Write-Host "⚠️ No PR links for work item $wiId"
-                            continue
+                  $wiUrl = "$orgUrl/$project/_apis/wit/workitems/$wiId?`$expand=relations&api-version=7.0"
+                  try {
+                    $wiDetails = Invoke-RestMethod -Uri $wiUrl -Headers $headers
+                  } catch {
+                    Write-Host "##[error]Failed to fetch Work Item #${wiId}: $($_.Exception.Message)"
+                    continue
+                  }
+
+                  $prLinks = @()
+                  if ($wiDetails.relations) {
+                    $prLinks = $wiDetails.relations | Where-Object { $_.rel -eq "ArtifactLink" -and $_.url -like "*PullRequest*" }
+                  }
+
+                  if (-not $prLinks -or $prLinks.Count -eq 0) {
+                    Write-Host "⚠️ No PRs linked to Work Item #${wiId}. Skipping."
+                    continue
+                  }
+
+                  $allApproved = $true
+
+                  foreach ($prLink in $prLinks) {
+                    if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
+                      $prId = $matches[1]
+                      Write-Host "🔗 Checking PR #${prId}..."
+
+                      $prUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId?api-version=7.0"
+                      try {
+                        $pr = Invoke-RestMethod -Uri $prUrl -Headers $headers
+                        if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
+                          $mergeCommit = $pr.lastMergeCommit.commitId
+                          Write-Host "✅ PR #${prId} merged successfully with commit ${mergeCommit}"
+                          $cherryPickCommits += $mergeCommit
+                        } else {
+                          Write-Host "🚫 PR #${prId} not yet merged or failed."
+                          $allApproved = $false
+                          break
                         }
-
-                        foreach ($prLink in $prLinks) {
-                            if ($prLink.url -match "vstfs:///Git/PullRequestId/(\d+)") {
-                                $prId = $matches[1]
-                                Write-Host "🔗 Checking PR #$prId"
-
-                                $prUrl = "$orgUrl/$project/_apis/git/repositories/$repo/pullRequests/$prId?api-version=7.0"
-                                try {
-                                    $pr = Invoke-RestMethod -Uri $prUrl -Headers $headers
-                                    if ($pr.status -eq "completed" -and $pr.mergeStatus -eq "succeeded") {
-                                        $mergeCommit = $pr.lastMergeCommit.commitId
-                                        Write-Host "✅ PR #$prId merged with commit $mergeCommit"
-                                        $cherryPickCommits += $mergeCommit
-                                    } else {
-                                        Write-Host "🚫 PR #$prId not merged"
-                                    }
-                                } catch {
-                                    Write-Host "##[error]Failed to fetch PR #$prId: $($_.Exception.Message)"
-                                }
-                            }
-                        }
-                    } catch {
-                        Write-Host "##[error]Failed to get work item $wiId: $($_.Exception.Message)"
+                      } catch {
+                        Write-Host "##[error]Failed to fetch PR #${prId}: $($_.Exception.Message)"
+                        $allApproved = $false
+                        break
+                      }
                     }
+                  }
+
+                  if ($allApproved) {
+                    Write-Host "✅ Work Item #${wiId} approved for release."
+                    $qualifiedWorkItems += $wiId
+                  } else {
+                    Write-Host "🚫 Work Item #${wiId} excluded (not all PRs approved)."
+                  }
                 }
 
-                if (-not $cherryPickCommits) {
-                    Write-Host "##[warning]No commits found to cherry-pick."
-                    exit 0
+                if (-not $qualifiedWorkItems -or $qualifiedWorkItems.Count -eq 0) {
+                  Write-Host "⚠️ No work items qualified for release."
+                  exit 0
                 }
 
-                Write-Host "✅ Commits to cherry-pick: $($cherryPickCommits -join ', ')"
+                Write-Host "🎯 Qualified Work Items: $($qualifiedWorkItems -join ', ')"
+                Write-Host "📦 Commits to Cherry-Pick: $($cherryPickCommits -join ', ')"
 
-                # === STEP 3: Create or Update Release Branch ===
+                # --- STEP 3: Create or Update Release Branch ---
+                Write-Host "##[section]🔧 Creating/Updating branch '${releaseBranch}'..."
+
                 git config --global user.email "build@azure.dev"
                 git config --global user.name "Azure DevOps"
 
@@ -117,30 +149,30 @@ stages:
                 $branchExists = git ls-remote --heads origin $releaseBranch
 
                 if ($branchExists) {
-                    Write-Host "📦 Release branch exists. Checking out..."
-                    git checkout $releaseBranch
-                    git pull origin $releaseBranch
+                  Write-Host "📦 Branch exists. Checking out..."
+                  git checkout $releaseBranch
+                  git pull origin $releaseBranch
                 } else {
-                    Write-Host "🌱 Creating new release branch from main..."
-                    git checkout main
-                    git pull origin main
-                    git checkout -b $releaseBranch
+                  Write-Host "🌱 Creating new branch from main..."
+                  git checkout main
+                  git pull origin main
+                  git checkout -b $releaseBranch
                 }
 
-                # === STEP 4: Cherry-pick PR merge commits ===
+                # --- STEP 4: Cherry-Pick PR commits ---
                 foreach ($commit in $cherryPickCommits) {
-                    try {
-                        Write-Host "🔧 Cherry-picking commit $commit..."
-                        git cherry-pick $commit
-                    } catch {
-                        Write-Host "⚠️ Conflict occurred while cherry-picking commit $commit"
-                        git cherry-pick --abort
-                        Write-Host "Skipping commit $commit due to conflict."
-                    }
+                  try {
+                    Write-Host "🔄 Cherry-picking commit ${commit}..."
+                    git cherry-pick $commit
+                  } catch {
+                    Write-Host "⚠️ Cherry-pick failed for commit ${commit}. Attempting to continue..."
+                    git cherry-pick --abort
+                  }
                 }
 
-                # === STEP 5: Push Updated Branch ===
-                Write-Host "📤 Pushing updated release branch..."
-                git push origin $releaseBranch
+                # --- STEP 5: Push release branch ---
+                Write-Host "##[section]📤 Pushing release branch..."
+                git push origin $releaseBranch --force-with-lease
 
-                Write-Host "🎉 Release branch '${releaseBranch}' updated with cherry-picked commits!"
+                Write-Host "🎉 Release branch '${releaseBranch}' created/updated successfully!"
+                Write-Host "✅ Cherry-picked all approved PR commits."
